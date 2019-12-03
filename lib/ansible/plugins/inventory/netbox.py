@@ -3,6 +3,20 @@
 
 from __future__ import (absolute_import, division, print_function)
 
+import json
+import uuid
+from sys import version as python_version
+from threading import Thread
+from itertools import chain
+
+from ansible.plugins.inventory import BaseInventoryPlugin, Constructable, Cacheable
+from ansible.module_utils.ansible_release import __version__ as ansible_version
+from ansible.errors import AnsibleError
+from ansible.module_utils._text import to_text
+from ansible.module_utils.urls import open_url
+from ansible.module_utils.six.moves.urllib.parse import urlencode
+from ansible.module_utils.compat.ipaddress import ip_interface
+
 __metaclass__ = type
 
 DOCUMENTATION = '''
@@ -39,6 +53,16 @@ DOCUMENTATION = '''
                 - If True, it adds config-context in host vars.
                 - Config-context enables the association of arbitrary data to devices and virtual machines grouped by
                   region, site, role, platform, and/or tenant. Please check official netbox docs for more info.
+            default: False
+            type: boolean
+        interfaces:
+            description:
+                - If True, it adds interfaces in host vars.
+            default: False
+            type: boolean
+        ip_address_additional:
+            description:
+                - If True, it looks up additional information about primary ip address.
             default: False
             type: boolean
         token:
@@ -83,6 +107,8 @@ plugin: netbox
 api_endpoint: http://localhost:8000
 validate_certs: True
 config_context: False
+interfaces: True
+ip_address_additional: True
 group_by:
   - device_roles
 query_filters:
@@ -113,20 +139,6 @@ compose:
   bar: display_name
   nested_variable: rack.display_name
 '''
-
-import json
-import uuid
-from sys import version as python_version
-from threading import Thread
-from itertools import chain
-
-from ansible.plugins.inventory import BaseInventoryPlugin, Constructable, Cacheable
-from ansible.module_utils.ansible_release import __version__ as ansible_version
-from ansible.errors import AnsibleError
-from ansible.module_utils._text import to_text
-from ansible.module_utils.urls import open_url
-from ansible.module_utils.six.moves.urllib.parse import urlencode
-from ansible.module_utils.compat.ipaddress import ip_interface
 
 ALLOWED_DEVICE_QUERY_PARAMETERS = (
     "asset_tag",
@@ -227,6 +239,57 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         return hosts_list
 
     @property
+    def ip_address_extractors(self):
+        return {
+            "dns_name": self.extract_dns_name,
+        }
+
+    def extract_dns_name(self, ip):        
+        return ip.get("dns_name")
+
+    @property
+    def interface_extractors(self):
+        return {
+            "mtu": self.extract_interface_mtu,
+            "name": self.extract_interface_name,
+            "mac_address": self.extract_interface_mac_address,
+            "mode": self.extract_interface_mode,
+            "tagged_vlans": self.extract_interface_tagged_vlans,
+            "untagged_vlan": self.extract_interface_untagged_vlan,            
+            "type": self.extract_interface_type,
+        }
+
+    def extract_interface_mtu(self, interface):        
+        return interface.get("mtu")
+
+    def extract_interface_name(self, interface):
+        return interface.get("name")
+
+    def extract_interface_mac_address(self, interface):
+        return "" if interface.get("mac_address") is None else interface.get("mac_address")
+
+    def extract_interface_mode(self, interface):
+        try:
+            return interface.get("mode").get("label")
+        except Exception:
+            return ""
+
+    def extract_interface_tagged_vlans(self, interface):
+        return interface.get("tagged_vlans")
+
+    def extract_interface_untagged_vlan(self, interface):
+        try:
+            return interface.get("untagged_vlan").get("name")
+        except Exception:
+            return ""
+
+    def extract_interface_type(self, interface):
+        try:
+            return interface.get("type").get("label")
+        except Exception:
+            return ""
+
+    @property
     def group_extractors(self):
         return {
             "sites": self.extract_site,
@@ -240,7 +303,8 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             "platforms": self.extract_platform,
             "device_types": self.extract_device_type,
             "config_context": self.extract_config_context,
-            "manufacturers": self.extract_manufacturer
+            "manufacturers": self.extract_manufacturer,
+            "interfaces": self.extract_interfaces,            
         }
 
     def extract_disk(self, host):
@@ -293,14 +357,53 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
     def extract_config_context(self, host):
         try:
-            return [host["config_context"]]
+            return host["config_context"]
         except Exception:
+            return
+
+    def interface_lookup(self, host):
+        # Check if virtual device
+        if host["cluster"] is None:
+            url = self.api_endpoint + "/api/dcim/interfaces/?device_id=" + str(host["id"])
+        else:
+            url = self.api_endpoint + "/api/virtualization/interfaces/?virtual_machine_id=" + str(host["id"])
+        # Fetch interface data
+        return self._fetch_information(url)
+
+    def extract_interfaces(self, host):                
+        try:
+            interface = {}
+            interfaces = []
+            if self.interfaces:
+                interface_lookup = self.interface_lookup(host)
+                # Check results
+                if 'results' in interface_lookup:
+                    for nic in interface_lookup['results']:
+                        for attribute, extractor in self.interface_extractors.items():                                        
+                            interface[attribute] = extractor(nic)
+                        interfaces.append(interface)
+                    return interfaces
+                else:
+                    return []       
+        except Exception:            
             return
 
     def extract_manufacturer(self, host):
         try:
             return [self.manufacturers_lookup[host["device_type"]["manufacturer"]["id"]]]
         except Exception:
+            return
+
+    def extract_ip_address_additional(self, host):
+        try:
+            url = self.api_endpoint + "/api/ipam/ip-addresses/" + str(host["primary_ip"]["id"])
+            # Fetch interface data
+            ip_payload = self._fetch_information(url)
+            ip = {}           
+            for attribute, extractor in self.ip_address_extractors.items():
+                ip[attribute] = extractor(ip_payload)            
+            return ip            
+        except Exception:            
             return
 
     def extract_primary_ip(self, host):
@@ -453,6 +556,9 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         if self.extract_primary_ip6(host):
             self.inventory.set_variable(hostname, "primary_ip6", self.extract_primary_ip6(host=host))
 
+        if self.ip_address_additional:
+            self.inventory.set_variable(hostname, "ip_address_additional", self.extract_ip_address_additional(host=host))
+
     def main(self):
         self.refresh_lookups()
         self.refresh_url()
@@ -487,6 +593,8 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         self.timeout = self.get_option("timeout")
         self.validate_certs = self.get_option("validate_certs")
         self.config_context = self.get_option("config_context")
+        self.interfaces = self.get_option("interfaces")
+        self.ip_address_additional = self.get_option("ip_address_additional")
         self.headers = {
             'Authorization': "Token %s" % token,
             'User-Agent': "ansible %s Python %s" % (ansible_version, python_version.split(' ')[0]),
